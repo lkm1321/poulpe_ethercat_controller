@@ -14,6 +14,9 @@ use tonic::{transport::Uri, Request};
 
 use poulpe_ethercat_controller::{register::BoardStatus, state_machine::CiA402State};
 
+const RECONNECT_BACKOFF_INITIAL_MS: u64 = 100;
+const RECONNECT_BACKOFF_MAX_MS: u64 = 5_000;
+
 #[derive(Debug)]
 enum Command {
     EmergencyStop(bool),
@@ -166,63 +169,102 @@ impl PoulpeRemoteClient {
         }
 
         // spawn a single thread to handle both the state stream and command stream
+        // with automatic reconnection on transport / stream errors.
+        let poulpe_ids_for_stream: Vec<i32> = poulpe_ids.iter().map(|&id| id as i32).collect();
         rt.spawn(async move {
-            // Connect to the server
-            let mut client = match PoulpeMultiplexerClient::connect(url).await {
-                Ok(client) => client,
-                Err(e) => {
-                    log::error!(
-                        "Error in connecting to the server! Check if server is up!!!\n  {:?}",
-                        e
-                    );
-                    return;
-                }
-            };
-
-            // Prepare the state stream request
-            let state_request = Request::new(StateStreamRequest {
-                ids: poulpe_ids.iter().map(|&id| id as i32).collect(),
-                update_period: update_period.as_secs_f32(),
-            });
-
-            // Start receiving states
-            let mut state_stream = client.get_states(state_request).await.unwrap().into_inner();
-
-            // Prepare the command stream
-            let command_stream = async_stream::stream! {
-                // fixed frequency
-                let mut interval = tokio::time::interval(update_period / 2);
-
-                loop {
-                    // next cycle
-                    interval.tick().await;
-                    let mut cmd_map = command_buff_lock.write().await;
-                    if let Some(commands) = extract_commands(&mut cmd_map) {
-                        yield commands;
+            let mut backoff_ms: u64 = RECONNECT_BACKOFF_INITIAL_MS;
+            loop {
+                // 1) (Re)connect to the server.
+                let mut client = match PoulpeMultiplexerClient::connect(url.clone()).await {
+                    Ok(client) => {
+                        log::info!("gRPC client connected to {}", url);
+                        backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
+                        client
                     }
-                }
-            };
+                    Err(e) => {
+                        log::warn!(
+                            "gRPC client connect to {} failed ({:?}); retrying in {} ms",
+                            url, e, backoff_ms
+                        );
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
+                        continue;
+                    }
+                };
 
-            // Send commands in parallel with state handling
-            tokio::select! {
-                // Handle state stream
-                _ = async {
-                    while let Some(poulpe_state) = state_stream.message().await.unwrap() {
-                        log::debug!("Update state with {:?}", poulpe_state);
-                        let mut state_buff = state_lock.write().await;
-                        for s in poulpe_state.states {
-                            state_buff.insert(s.id as u16, s);
+                // 2) Open the state stream.
+                let state_request = Request::new(StateStreamRequest {
+                    ids: poulpe_ids_for_stream.clone(),
+                    update_period: update_period.as_secs_f32(),
+                });
+                let mut state_stream = match client.get_states(state_request).await {
+                    Ok(resp) => resp.into_inner(),
+                    Err(e) => {
+                        log::warn!(
+                            "gRPC GetStates failed ({:?}); reconnecting in {} ms",
+                            e, backoff_ms
+                        );
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
+                        continue;
+                    }
+                };
+
+                // 3) Open the command stream. Clone the locks once per attempt so the
+                //    async_stream! capture does not consume the outer Arcs.
+                let command_buff_lock_inner = Arc::clone(&command_buff_lock);
+                let state_lock_inner = Arc::clone(&state_lock);
+                let command_stream_period = update_period / 2;
+                let command_stream = async_stream::stream! {
+                    let mut interval = tokio::time::interval(command_stream_period);
+                    loop {
+                        interval.tick().await;
+                        let mut cmd_map = command_buff_lock_inner.write().await;
+                        if let Some(commands) = extract_commands(&mut cmd_map) {
+                            yield commands;
                         }
                     }
-                } => {},
+                };
 
-                // Handle command stream
-                result = client.get_commands(Request::new(command_stream)) => {
-                    match result {
-                        Ok(_) => log::info!("Command stream ended"),
-                        Err(e) => log::error!("Error in command stream: {:?}", e),
+                // 4) Drive both streams concurrently; whichever finishes/fails first
+                //    breaks us out so we can reconnect.
+                tokio::select! {
+                    reason = async {
+                        loop {
+                            match state_stream.message().await {
+                                Ok(Some(poulpe_state)) => {
+                                    log::debug!("Update state with {:?}", poulpe_state);
+                                    let mut state_buff = state_lock_inner.write().await;
+                                    for s in poulpe_state.states {
+                                        state_buff.insert(s.id as u16, s);
+                                    }
+                                }
+                                Ok(None) => break String::from("server closed state stream"),
+                                Err(e) => break format!("state stream error: {:?}", e),
+                            }
+                        }
+                    } => {
+                        log::warn!("gRPC state stream ended ({}); reconnecting in {} ms", reason, backoff_ms);
                     }
-                },
+
+                    result = client.get_commands(Request::new(command_stream)) => {
+                        match result {
+                            Ok(_) => log::warn!(
+                                "gRPC command stream ended cleanly; reconnecting in {} ms",
+                                backoff_ms
+                            ),
+                            Err(e) => log::warn!(
+                                "gRPC command stream error ({:?}); reconnecting in {} ms",
+                                e, backoff_ms
+                            ),
+                        }
+                    }
+                }
+
+                // Brief backoff before reconnecting so we don't hammer a server that is
+                // still coming back up.
+                sleep(Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(RECONNECT_BACKOFF_MAX_MS);
             }
         });
 
@@ -270,21 +312,25 @@ impl PoulpeRemoteClient {
 
         if let Some(ts) = &state.published_timestamp {
             if let Ok(systime) = std::time::SystemTime::try_from(ts.clone()) {
-                if systime.elapsed().unwrap().as_millis() > 1000 {
-                    log::error!(
-                        "State is older than 1s for slave {}, server maybe down!",
-                        slave_id
+                // SystemTime::elapsed() returns Err if the wall clock ran backwards
+                // between publish and now — treat that as zero elapsed (stream just
+                // arrived), not a fatal panic.
+                let age = systime.elapsed().unwrap_or_default();
+                if age.as_millis() > 1000 {
+                    // The server has stopped publishing for >1s. Surface this to the
+                    // caller as an error so it can react (hold position, etc.), but do
+                    // NOT terminate the host process — the reconnect loop in this
+                    // client and the recovery FSM in the server are expected to bring
+                    // the stream back without a manual restart.
+                    log::warn!(
+                        "State for slave {} is {} ms old; server may be temporarily down",
+                        slave_id,
+                        age.as_millis()
                     );
-                    // kill the slave if error recovery not supported
-                    #[cfg(feature = "stop_client_on_server_timeout")]
-                    std::process::exit(10);
                     return Err(());
                 }
             } else {
                 log::warn!("Cannot parse the timestamp, discarding message!");
-                // kill the slave if error recovery not supported
-                #[cfg(feature = "stop_client_on_server_timeout")]
-                std::process::exit(10);
                 return Err(());
             }
         } else {

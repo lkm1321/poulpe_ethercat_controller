@@ -14,6 +14,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9.11"
 env_logger = "0.9.0"
 crossbeam-channel = "0.5"
+# Wait-free shared pointer used for the loop -> gRPC state hand-off so the
+# 1 kHz cyclic loop never blocks on a reader-held lock.
+arc-swap = "1"
 
 [features]
 default = ["enable_watchdog" ,"verify_mailbox_pdos",  "stop_opeation_on_error"]

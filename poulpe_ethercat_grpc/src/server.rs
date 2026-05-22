@@ -1,10 +1,11 @@
 use std::{
+    collections::HashMap,
     env,
     f32::consts::E,
     mem::take,
     sync::Arc,
     task::Context,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use poulpe_ethercat_controller::{state_machine::CiA402State, PoulpeController};
@@ -563,8 +564,19 @@ pub async fn launch_server(config_file: &str) -> Result<(), Box<dyn std::error::
     log::info!("POULPE controller ready!");
 
     let addr = "[::]:50098".parse()?;
+    let controller_arc = Arc::new(controller);
+
+    // Recovery thread: detects per-slave OP <-> non-OP transitions, clears the
+    // setup flag on drop, and re-runs the CiA-402 bring-up FSM on rejoin so the
+    // robot becomes controllable again without a server restart.
+    //
+    // This runs on its own thread (the bring-up FSM is blocking — it sleeps and
+    // polls PDOs), separate from the 1 kHz cyclic loop and from the tokio gRPC
+    // workers, so neither is delayed by setup() calls.
+    spawn_slave_recovery_thread(Arc::clone(&controller_arc));
+
     let srv = PoulpeMultiplexerService {
-        controller: Arc::new(controller),
+        controller: controller_arc,
     };
 
     Server::builder()
@@ -573,6 +585,86 @@ pub async fn launch_server(config_file: &str) -> Result<(), Box<dyn std::error::
         .await?;
 
     Ok(())
+}
+
+/// Spawn the background recovery worker. See call-site for the why.
+fn spawn_slave_recovery_thread(controller: Arc<PoulpeController>) {
+    // How often to poll slave readiness. 100 ms is fast enough to catch a
+    // recovering bus within a couple of cycles and slow enough not to be a
+    // perceivable cost.
+    const POLL_PERIOD: Duration = Duration::from_millis(100);
+    // Throttle re-attempts of the bring-up FSM for the same slave when it
+    // keeps failing (e.g. slave in Fault), so we don't spin.
+    const RESETUP_RETRY: Duration = Duration::from_millis(500);
+
+    std::thread::Builder::new()
+        .name("poulpe-recovery".to_string())
+        .spawn(move || {
+            let slave_ids: Vec<u32> = controller.get_slave_ids();
+            let mut was_ready: HashMap<u32, bool> = HashMap::new();
+            let mut last_attempt: HashMap<u32, Instant> = HashMap::new();
+
+            loop {
+                std::thread::sleep(POLL_PERIOD);
+
+                for &id in &slave_ids {
+                    let ready = controller.is_slave_ready(id as u16);
+                    let prev = was_ready.get(&id).copied().unwrap_or(ready);
+
+                    if prev && !ready {
+                        // OP -> non-OP transition. The slave dropped off the bus.
+                        // Clear its setup flag so that, when it returns, we re-run
+                        // the CiA-402 bring-up FSM instead of treating it as a
+                        // ready-to-command actuator (it has likely power-cycled and
+                        // is now in SwitchedOnDisabled).
+                        controller.set_poulpe_setup(id, false);
+                        log::warn!(
+                            "Slave {} ({:?}) dropped out of OP; cleared setup flag",
+                            id,
+                            controller.get_slave_name(id as u16)
+                        );
+                    } else if !prev && ready {
+                        log::info!(
+                            "Slave {} ({:?}) returned to OP",
+                            id,
+                            controller.get_slave_name(id as u16)
+                        );
+                    }
+                    was_ready.insert(id, ready);
+
+                    // If a slave is OP but not set up (either it never was, or it
+                    // dropped and just came back), kick off the bring-up FSM, with
+                    // a per-slave retry backoff so a fault doesn't melt CPU.
+                    if ready && !controller.is_poulpe_setup(id) {
+                        let stale = last_attempt
+                            .get(&id)
+                            .map(|t| t.elapsed() >= RESETUP_RETRY)
+                            .unwrap_or(true);
+                        if stale {
+                            last_attempt.insert(id, Instant::now());
+                            log::info!(
+                                "Slave {} ({:?}) ready but not setup — running bring-up FSM",
+                                id,
+                                controller.get_slave_name(id as u16)
+                            );
+                            match controller.setup(id) {
+                                Ok(_) => log::info!(
+                                    "Slave {} ({:?}) bring-up FSM complete",
+                                    id,
+                                    controller.get_slave_name(id as u16)
+                                ),
+                                Err(e) => log::warn!(
+                                    "Slave {} bring-up FSM failed: {} (will retry)",
+                                    id,
+                                    e
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn poulpe-recovery thread");
 }
 
 fn poule_empty_state() -> PoulpeState {

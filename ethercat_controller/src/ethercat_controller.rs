@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{self, Read},
     ops::Range,
-    sync::{Arc, Condvar, Mutex, RwLock},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::Duration,
 };
@@ -14,6 +14,7 @@ use ethercat::{
     SmIdx, SmInfo, SubIdx,
 };
 
+use arc_swap::ArcSwapOption;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::{watchdog, MailboxPdoEntries, PdoOffsets, SlaveNames, SlaveOffsets, SlaveSetup};
@@ -35,7 +36,11 @@ pub struct EtherCatController {
     offsets: SlaveOffsets,
     slave_names: SlaveNames,
 
-    data_lock: Arc<RwLock<Option<Vec<u8>>>>,
+    // Wait-free snapshot of the latest EtherCAT domain data, published by the
+    // cyclic loop and read by gRPC handlers. Using ArcSwapOption (no mutex)
+    // guarantees the 1 kHz loop never blocks on a reader; readers see the
+    // most-recently-published snapshot via an atomic pointer load.
+    data_lock: Arc<ArcSwapOption<Vec<u8>>>,
     ready_condvar: Arc<(Mutex<bool>, Condvar)>,
     cycle_condvar: Arc<(Mutex<bool>, Condvar)>,
     slave_states_condvar: Arc<(Mutex<Vec<u8>>, Condvar)>,
@@ -109,8 +114,10 @@ impl EtherCatController {
         log_pdo_offsets(&offsets);
 
         // create the synhronization variables
-        // EtherCAT data mutex
-        let data_lock = Arc::new(RwLock::new(None));
+        // EtherCAT domain-data snapshot. ArcSwapOption gives readers (gRPC
+        // handlers) a wait-free atomic load and lets the cyclic loop publish
+        // each cycle without ever taking a writer lock.
+        let data_lock: Arc<ArcSwapOption<Vec<u8>>> = Arc::new(ArcSwapOption::empty());
         let write_data_lock = Arc::clone(&data_lock);
 
         // ethercat master ready mutex
@@ -234,10 +241,12 @@ impl EtherCatController {
                     mailbox_wait_time_ms,
                 );
 
-                // write the data to the data lock
-                if let Ok(mut write_guard) = write_data_lock.write() {
-                    *write_guard = Some(data.to_vec());
-                }
+                // Publish the fresh domain snapshot to gRPC readers via a
+                // wait-free atomic pointer swap. The cyclic loop never blocks
+                // here, regardless of how many readers are concurrently loading
+                // an older snapshot (their Arc<Vec<u8>> stays alive until they
+                // drop it). One Vec/Arc allocation per cycle is the only cost.
+                write_data_lock.store(Some(Arc::new(data.to_vec())));
 
                 // notify the next cycle
                 notify_next_cycle(&write_cycle_condvar);
@@ -321,12 +330,23 @@ impl EtherCatController {
                         );
                         log::info!("Master and all slaves operational!");
                     } else {
-                        // check each second
+                        // Master is not operational. Stay in this state, keep the
+                        // cyclic loop alive, and keep retrying the OP transition
+                        // every cycle. The bus dropout that brought us here is
+                        // typically transient (~seconds) and recovers on its own.
+                        //
+                        // We deliberately do NOT std::process::exit() — the previous
+                        // behavior of exiting the process here is what caused the
+                        // crash cascade: gRPC streams broke, clients panicked, the
+                        // host (ros2_control_node) segfaulted. Now we stay in a
+                        // Degraded/Recovering state and let the recovery thread
+                        // re-run the CiA-402 bring-up FSM on the slaves when they
+                        // return.
                         if display_not_operational_timestamp.elapsed().as_secs() > 1 {
                             display_not_operational_timestamp = std::time::Instant::now();
-                            log::warn!("Master cannot go to operational!");
-                            // display the master state
-                            // if the master is not operational
+                            log::warn!(
+                                "EtherCAT master Degraded/Recovering — still trying to reach OP"
+                            );
                             log_master_state(
                                 &master,
                                 slave_number,
@@ -340,10 +360,6 @@ impl EtherCatController {
                                 #[cfg(feature = "enable_watchdog")]
                                 &slave_is_watchdog_responding,
                             );
-
-                            // kill the master if error recovery not supported
-                            #[cfg(feature = "stop_opeation_on_error")]
-                            std::process::exit(10);
                         }
                     }
                 } else {
@@ -484,7 +500,11 @@ impl EtherCatController {
     ) -> Option<Vec<u8>> {
         let reg_addr_range = self.get_reg_addr_range(slave_id, register, index);
 
-        (*self.data_lock.read().unwrap())
+        // Wait-free read: load the current snapshot Arc atomically; the cyclic
+        // loop is never blocked by this access. Returns None until the loop has
+        // published at least once (matches the pre-arc-swap behavior).
+        self.data_lock
+            .load()
             .as_ref()
             .map(|data| data[reg_addr_range].to_vec())
     }
@@ -516,14 +536,14 @@ impl EtherCatController {
     pub fn get_pdo_registers(&self, slave_id: u16, register: &String) -> Option<Vec<Vec<u8>>> {
         let reg_addr_ranges = self.get_reg_addr_ranges(slave_id, register);
 
+        // Take a single snapshot so all ranges for this call see a consistent
+        // view of the EtherCAT domain (no tearing across PDOs in one slave).
+        let snapshot = self.data_lock.load();
+        let data = snapshot.as_ref()?;
         let vals = reg_addr_ranges
             .iter()
-            .map(|reg_addr_range| {
-                (*self.data_lock.read().unwrap())
-                    .as_ref()
-                    .map(|data| data[reg_addr_range.clone()].to_vec())
-            })
-            .collect::<Option<Vec<Vec<u8>>>>()?;
+            .map(|reg_addr_range| data[reg_addr_range.clone()].to_vec())
+            .collect::<Vec<Vec<u8>>>();
         Some(vals)
     }
 
