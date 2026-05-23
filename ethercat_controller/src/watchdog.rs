@@ -86,6 +86,13 @@ pub fn verify_watchdog(
     for i in 0..slave_number {
         // get slave watchdog control offset
         let status_offset = slave_watchdog_status_offsets[i as usize].clone();
+        // Skip slaves with no watchdog offsets — these are bus couplers /
+        // non-CiA-402 devices that init_watchdog_settings deliberately left
+        // unregistered. Indexing into an empty status_data here would panic
+        // ("status_data[0]"), undoing the open-time graceful skip.
+        if status_offset.is_empty() {
+            continue;
+        }
         // get the watchdog control data
         let status_data = status_offset
             .iter()
@@ -205,7 +212,15 @@ pub fn init_watchdog_settings(
 }
 
 /// Looks up the address ranges of a CiA 402 mandatory PDO on `slave_id`.
-/// Returns an io::Error if the slave or register is missing — never panics.
+///
+/// Returns an io::Error if a CiA-402 slave is missing the register.
+/// Returns Ok(empty Vec) for non-CiA-402 slaves (bus couplers / hubs):
+/// init_master enumerates every device on the bus and inserts an entry
+/// into `offsets` for each, but coupler-class devices have no PDOs of
+/// their own (sm_info.pdo_count == 0 in init_master's loop), so they
+/// land in `offsets` as an empty per-slave map. Watchdog tracking
+/// doesn't apply to such devices — skip with an info log so the
+/// operator can correlate, but don't refuse to start.
 fn lookup_required_pdo(
     offsets: &SlaveOffsets,
     slave_id: u16,
@@ -221,6 +236,13 @@ fn lookup_required_pdo(
             ),
         )
     })?;
+    if slave_map.is_empty() {
+        log::info!(
+            "init_watchdog_settings: slave_id {} has no PDOs (bus coupler or non-CiA-402 device); skipping watchdog tracking",
+            slave_id
+        );
+        return Ok(vec![]);
+    }
     let entries = slave_map.get(register).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
