@@ -212,13 +212,34 @@ impl EtherCatController {
                     debug_loop_counter = 0;
                 }
 
-                // get the master data
-                master.receive().unwrap();
-                master.domain(domain_idx).process().unwrap();
-                master.domain(domain_idx).queue().unwrap();
+                // get the master data. On a transient bus error, the IgH
+                // master returns Err from these calls; if we unwrap() the
+                // entire cyclic-loop thread panics, which freezes data_lock
+                // (state-stream task then keeps publishing frozen-but-
+                // fresh-stamped data) and leaves the master unrecoverable.
+                // Log and skip this cycle instead — the next iteration will
+                // retry. A missed cycle is acceptable; a dead loop is not.
+                if let Err(e) = master.receive() {
+                    log::warn!("EtherCAT master.receive() failed: {:?}; skipping cycle", e);
+                    continue;
+                }
+                if let Err(e) = master.domain(domain_idx).process() {
+                    log::warn!("EtherCAT domain.process() failed: {:?}; skipping cycle", e);
+                    continue;
+                }
+                if let Err(e) = master.domain(domain_idx).queue() {
+                    log::warn!("EtherCAT domain.queue() failed: {:?}; skipping cycle", e);
+                    continue;
+                }
 
                 // get the domain data
-                let mut data = master.domain_data(domain_idx).unwrap();
+                let mut data = match master.domain_data(domain_idx) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("EtherCAT domain_data() failed: {:?}; skipping cycle", e);
+                        continue;
+                    }
+                };
 
                 // verify that the poulpes are still writing
                 // for each slave check if the mailbox mailbox pdo entries are updated
@@ -279,11 +300,22 @@ impl EtherCatController {
                 // update the watchdog counter
                 watchdog_counter = (watchdog_counter + 1) % 8;
 
-                // send the data to the slaves
-                master.send().unwrap();
+                // send the data to the slaves. Same rationale as the receive
+                // path above: on a transient bus error we log and skip rather
+                // than panic the cyclic loop.
+                if let Err(e) = master.send() {
+                    log::warn!("EtherCAT master.send() failed: {:?}; skipping cycle", e);
+                    continue;
+                }
 
                 // get the master state
-                let m_state = master.state().unwrap();
+                let m_state = match master.state() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("EtherCAT master.state() failed: {:?}; skipping cycle", e);
+                        continue;
+                    }
+                };
                 #[cfg(not(feature = "verify_mailbox_pdos"))]
                 // get the slave states without mailbox verification
                 let all_slaves_responding = m_state.slaves_responding == slave_number;

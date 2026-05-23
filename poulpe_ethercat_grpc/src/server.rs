@@ -205,6 +205,13 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
             // fixed frequency
             let mut interval =
                 tokio::time::interval(Duration::from_secs_f32(request.update_period));
+            // If a tick is missed (e.g. tx.send back-pressure, runtime
+            // starvation), do NOT burst-replay the missed ticks — each
+            // burst-replayed publish carries a fresh-from-now timestamp
+            // but represents stale state, and the burst itself can push
+            // genuine new-state publishes behind by N*update_period. Skip
+            // instead so the next publish is the next on-time tick.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             // state to be sent if no state is available
             // this is to avoid sending empty states
@@ -687,6 +694,10 @@ fn poule_empty_state() -> PoulpeState {
         state: 0,
         error_codes: vec![],
         compliant: false,
-        published_timestamp: None,
+        // Seed with "now" so the very first publish (which sends the empty
+        // state when slaves haven't enumerated yet) carries a fresh
+        // timestamp. A None here makes the client log "No timestamp" and
+        // can make downstream HIs treat the slot as ancient.
+        published_timestamp: Some(Timestamp::from(SystemTime::now())),
     }
 }

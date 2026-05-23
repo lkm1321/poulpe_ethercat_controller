@@ -15,7 +15,12 @@ use tonic::{transport::Uri, Request};
 use poulpe_ethercat_controller::{register::BoardStatus, state_machine::CiA402State};
 
 const RECONNECT_BACKOFF_INITIAL_MS: u64 = 100;
-const RECONNECT_BACKOFF_MAX_MS: u64 = 5_000;
+// Cap below the 1s state-staleness window (see get_state_property). With a
+// 5s ceiling, a few consecutive reconnect failures push the next attempt
+// out past 1s and the cached PoulpeState in state_lock ages out before we
+// can refresh it — surfacing as "state too old" in the HI even though the
+// server has long since come back.
+const RECONNECT_BACKOFF_MAX_MS: u64 = 300;
 
 #[derive(Debug)]
 enum Command {
