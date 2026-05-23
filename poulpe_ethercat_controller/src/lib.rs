@@ -283,12 +283,13 @@ impl PoulpeController {
         // Orbita2D slave, or a slave that wasn't enumerated at startup).
         // Either way: propagate as Err so callers can surface a controlled
         // failure instead of unwinding via .unwrap().
+        let reg_name = reg.name();
         self.inner
-            .get_pdo_register(slave_id, &reg.name().to_string(), index)
+            .get_pdo_register(slave_id, &reg_name.to_string(), index)
             .ok_or_else(|| {
                 format!(
                     "No PDO data for slave {} register {:?} index {}",
-                    slave_id, reg, index
+                    slave_id, reg_name, index
                 )
                 .into()
             })
@@ -312,9 +313,12 @@ impl PoulpeController {
     ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
         // See get_pdo_register: propagate "no data / unknown register" as Err
         // instead of unwrapping.
+        let reg_name = reg.name();
         self.inner
-            .get_pdo_registers(slave_id, &reg.name().to_string())
-            .ok_or_else(|| format!("No PDO data for slave {} register {:?}", slave_id, reg).into())
+            .get_pdo_registers(slave_id, &reg_name.to_string())
+            .ok_or_else(|| {
+                format!("No PDO data for slave {} register {:?}", slave_id, reg_name).into()
+            })
     }
     fn set_pdo_registers(
         &self,
