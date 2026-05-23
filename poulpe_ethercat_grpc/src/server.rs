@@ -231,8 +231,11 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
                                 state
                             }
                             Err(e) => {
-                                log::error!("Failed to get state for slave {}: {}", id, e);
-                                last_state.clone()
+                                log::error!("Failed to get state for slave {}: {}. Returning stale state", id, e);
+                                let mut stale = last_state.clone();
+                                stale.published_timestamp = 
+                                    Some(Timestamp::from(std::time::SystemTime::now()));
+                                stale
                             }
                         })
                         .collect(),
