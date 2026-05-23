@@ -32,18 +32,56 @@ pub struct PoulpeController {
     pub poulpe_config: HashMap<u16, PoulpeKind>,
 }
 
+// Retry budget for EtherCatController::open. CiA-402 PDOs (controlword,
+// statusword) are mandatory on every Poulpe board, so a missing one means
+// either (a) a genuine bus enumeration race — the slave isn't ready when
+// the master enumerates, common on cold boot — which a retry resolves, or
+// (b) a real ESI/firmware mismatch, which no number of retries will fix.
+// 5 attempts at 500 ms apart covers (a) without burning forever on (b).
+const OPEN_RETRY_ATTEMPTS: u32 = 5;
+const OPEN_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 impl PoulpeController {
     pub fn connect(filename: &str) -> Result<Self, Box<dyn Error>> {
         let config = Config::from_yaml(filename)?;
 
-        let controller = EtherCatController::open(
-            config.ethercat.master_id,
-            Duration::from_micros(config.ethercat.cycle_time_us as u64),
-            config.ethercat.command_drop_time_us,
-            config.ethercat.watchdog_timeout_ms,
-            config.ethercat.mailbox_wait_time_ms,
-        )?
-        .wait_for_ready();
+        let mut last_err: Option<std::io::Error> = None;
+        let controller = 'open: {
+            for attempt in 1..=OPEN_RETRY_ATTEMPTS {
+                match EtherCatController::open(
+                    config.ethercat.master_id,
+                    Duration::from_micros(config.ethercat.cycle_time_us as u64),
+                    config.ethercat.command_drop_time_us,
+                    config.ethercat.watchdog_timeout_ms,
+                    config.ethercat.mailbox_wait_time_ms,
+                ) {
+                    Ok(c) => break 'open c.wait_for_ready(),
+                    Err(e) => {
+                        log::warn!(
+                            "EtherCatController::open attempt {}/{} failed: {}. \
+                             Retrying in {:?}",
+                            attempt,
+                            OPEN_RETRY_ATTEMPTS,
+                            e,
+                            OPEN_RETRY_DELAY
+                        );
+                        last_err = Some(e);
+                        std::thread::sleep(OPEN_RETRY_DELAY);
+                    }
+                }
+            }
+            // All retries exhausted — surface the last (most informative)
+            // error from init_watchdog_settings or init_master with the
+            // slave_id + missing PDO + available PDO list.
+            return Err(format!(
+                "EtherCatController::open failed after {} attempts: {}",
+                OPEN_RETRY_ATTEMPTS,
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string())
+            )
+            .into());
+        };
 
         let mut poulpe_config = HashMap::new();
 
@@ -239,10 +277,21 @@ impl PoulpeController {
         reg: PdoRegister,
         index: usize,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
-        Ok(self
-            .inner
+        // None means either (a) the cyclic loop hasn't published a snapshot
+        // yet, or (b) this slave/register/index isn't in the PDO offsets
+        // table (e.g. a query for an Orbita3D-specific register against an
+        // Orbita2D slave, or a slave that wasn't enumerated at startup).
+        // Either way: propagate as Err so callers can surface a controlled
+        // failure instead of unwinding via .unwrap().
+        self.inner
             .get_pdo_register(slave_id, &reg.name().to_string(), index)
-            .unwrap())
+            .ok_or_else(|| {
+                format!(
+                    "No PDO data for slave {} register {:?} index {}",
+                    slave_id, reg, index
+                )
+                .into()
+            })
     }
     fn set_pdo_register(
         &self,
@@ -261,10 +310,11 @@ impl PoulpeController {
         slave_id: u16,
         reg: PdoRegister,
     ) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
-        Ok(self
-            .inner
+        // See get_pdo_register: propagate "no data / unknown register" as Err
+        // instead of unwrapping.
+        self.inner
             .get_pdo_registers(slave_id, &reg.name().to_string())
-            .unwrap())
+            .ok_or_else(|| format!("No PDO data for slave {} register {:?}", slave_id, reg).into())
     }
     fn set_pdo_registers(
         &self,

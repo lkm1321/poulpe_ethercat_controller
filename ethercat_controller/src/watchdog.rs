@@ -1,5 +1,5 @@
-use crate::SlaveOffsets;
-use std::ops::Range;
+use crate::{SlaveOffsets, SlavePos};
+use std::{io, ops::Range};
 
 /// watchdog is added to the manufcturer specific data of the statusword
 /// bits 8, 14 and 15
@@ -154,14 +154,16 @@ pub fn verify_watchdog(
 pub fn init_watchdog_settings(
     slave_number: u32,
     offsets: &SlaveOffsets,
-    get_reg_addr_ranges: &impl Fn(&SlaveOffsets, u16, &String) -> Vec<Range<usize>>,
-) -> (
-    Vec<Vec<Range<usize>>>,
-    Vec<Vec<Range<usize>>>,
-    Vec<std::time::Instant>,
-    Vec<bool>,
-    Vec<u8>,
-) {
+) -> Result<
+    (
+        Vec<Vec<Range<usize>>>,
+        Vec<Vec<Range<usize>>>,
+        Vec<std::time::Instant>,
+        Vec<bool>,
+        Vec<u8>,
+    ),
+    io::Error,
+> {
     // initialize the watchdog variables
     // offsets of the statusword data in the domain data
     let mut slave_watchdog_status_offsets = vec![];
@@ -174,31 +176,70 @@ pub fn init_watchdog_settings(
     // buffer to store the watchdog data (that are read asynchronusly from the slaves)
     let slave_previous_watchdog_counter = vec![0u8; slave_number as usize];
 
-    // find the watchdog offsets for each slave
+    // Find the watchdog offsets for each slave. controlword (0x6040) and
+    // statusword (0x6041) are CiA 402 mandatory — every Poulpe board MUST
+    // expose them. If a slave on the bus is missing either, the slave can't
+    // be safely driven (no way to command the CiA 402 state machine), so we
+    // refuse to come up rather than running blind. Previously this used
+    // HashMap::index, which panicked with "no entry found for key" — now it
+    // returns a descriptive io::Error naming the slave_id, the missing PDO,
+    // and the PDOs the slave actually exposes (so the operator can tell
+    // whether it's an ESI/firmware mismatch or a transient enumeration race).
+    // The caller is expected to retry the whole `EtherCatController::open`
+    // a few times to absorb genuine enumeration races; persistent failure
+    // surfaces a real config bug.
     for i in 0..slave_number {
-        let mut watchdog_offsets = vec![];
-        watchdog_offsets.append(&mut get_reg_addr_ranges(
-            &offsets,
-            i as u16,
-            &"controlword".to_string(),
-        ));
-        slave_watchdog_control_offsets.push(watchdog_offsets);
+        slave_watchdog_control_offsets.push(lookup_required_pdo(offsets, i as u16, "controlword")?);
     }
     for i in 0..slave_number {
-        let mut watchdog_offsets = vec![];
-        watchdog_offsets.append(&mut get_reg_addr_ranges(
-            &offsets,
-            i as u16,
-            &"statusword".to_string(),
-        ));
-        slave_watchdog_status_offsets.push(watchdog_offsets);
+        slave_watchdog_status_offsets.push(lookup_required_pdo(offsets, i as u16, "statusword")?);
     }
 
-    (
+    Ok((
         slave_watchdog_control_offsets,
         slave_watchdog_status_offsets,
         slave_watchdog_timestamps,
         slave_is_watchdog_responding,
         slave_previous_watchdog_counter,
-    )
+    ))
+}
+
+/// Looks up the address ranges of a CiA 402 mandatory PDO on `slave_id`.
+/// Returns an io::Error if the slave or register is missing — never panics.
+fn lookup_required_pdo(
+    offsets: &SlaveOffsets,
+    slave_id: u16,
+    register: &str,
+) -> Result<Vec<Range<usize>>, io::Error> {
+    let slave_pos = SlavePos::from(slave_id);
+    let slave_map = offsets.get(&slave_pos).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "init_watchdog_settings: slave_id {} not in offsets (bus enumeration incomplete)",
+                slave_id
+            ),
+        )
+    })?;
+    let entries = slave_map.get(register).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "init_watchdog_settings: slave_id {} missing CiA-402 PDO {:?}. \
+                 Available PDOs on this slave: {:?}. \
+                 Either the bus enumeration was incomplete (transient — retry) or \
+                 the slave's firmware/ESI doesn't match the expected PDO map.",
+                slave_id,
+                register,
+                slave_map.keys().collect::<Vec<_>>()
+            ),
+        )
+    })?;
+    Ok(entries
+        .iter()
+        .map(|(_idx, bit_len, offset)| {
+            let bytes = (*bit_len / 8) as usize;
+            offset.byte..offset.byte + bytes
+        })
+        .collect())
 }

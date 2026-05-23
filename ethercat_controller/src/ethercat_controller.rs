@@ -168,14 +168,19 @@ impl EtherCatController {
         );
 
         #[cfg(feature = "enable_watchdog")]
-        // initialize the watchdog settings
+        // initialize the watchdog settings. CiA 402 mandates controlword and
+        // statusword on every slave; a missing one means the slave can't be
+        // safely driven, so init_watchdog_settings returns Err instead of
+        // panicking. The outer retry loop in EtherCatController::open_retry
+        // will re-enumerate the bus a few times to absorb transient races
+        // before giving up with the descriptive error from here.
         let (
             slave_watchdog_control_offsets,
             slave_watchdog_status_offsets,
             mut slave_watchdog_timestamps,
             mut slave_is_watchdog_responding,
             mut slave_previous_watchdog_counter,
-        ) = init_watchdog_settings(slave_number, &offsets, &get_reg_addr_ranges);
+        ) = init_watchdog_settings(slave_number, &offsets)?;
 
         let mut watchdog_counter = 0;
 
@@ -530,7 +535,10 @@ impl EtherCatController {
         register: &String,
         index: usize,
     ) -> Option<Vec<u8>> {
-        let reg_addr_range = self.get_reg_addr_range(slave_id, register, index);
+        // Look up the address range non-fatally. If the slave/register/index
+        // isn't in offsets, return None instead of panicking — the previous
+        // behavior (HashMap::index) killed the cyclic loop and the host.
+        let reg_addr_range = self.try_get_reg_addr_range(slave_id, register, index)?;
 
         // Wait-free read: load the current snapshot Arc atomically; the cyclic
         // loop is never blocked by this access. Returns None until the loop has
@@ -550,7 +558,15 @@ impl EtherCatController {
     /// * `index` - The index of the register
     /// * `value` - The value to set
     pub fn set_pdo_register(&self, slave_id: u16, register: &String, index: usize, value: Vec<u8>) {
-        let reg_addr_range = self.get_reg_addr_range(slave_id, register, index);
+        let Some(reg_addr_range) = self.try_get_reg_addr_range(slave_id, register, index) else {
+            log::warn!(
+                "set_pdo_register: slave {} register {:?} index {} not in offsets; ignoring",
+                slave_id,
+                register,
+                index,
+            );
+            return;
+        };
 
         self.cmd_buff.send((reg_addr_range, value)).unwrap();
     }
@@ -566,7 +582,9 @@ impl EtherCatController {
     ///
     /// * `Option<Vec<Vec<u8>>>` - The contents of the registers
     pub fn get_pdo_registers(&self, slave_id: u16, register: &String) -> Option<Vec<Vec<u8>>> {
-        let reg_addr_ranges = self.get_reg_addr_ranges(slave_id, register);
+        // Non-panicking lookup; returns None on unknown slave/register so the
+        // gRPC layer surfaces a clean error rather than aborting the process.
+        let reg_addr_ranges = self.try_get_reg_addr_ranges(slave_id, register)?;
 
         // Take a single snapshot so all ranges for this call see a consistent
         // view of the EtherCAT domain (no tearing across PDOs in one slave).
@@ -587,7 +605,14 @@ impl EtherCatController {
     /// * `register` - The name of the register
     /// * `values` - The values to set
     pub fn set_pdo_registers(&self, slave_id: u16, register: &String, values: Vec<Vec<u8>>) {
-        let reg_addr_ranges = self.get_reg_addr_ranges(slave_id, register);
+        let Some(reg_addr_ranges) = self.try_get_reg_addr_ranges(slave_id, register) else {
+            log::warn!(
+                "set_pdo_registers: slave {} register {:?} not in offsets; ignoring",
+                slave_id,
+                register,
+            );
+            return;
+        };
 
         if values.len() != reg_addr_ranges.len() {
             // log::error!("values: {:?}", values);
@@ -681,6 +706,27 @@ impl EtherCatController {
         get_reg_addr_ranges(&self.offsets, slave_id, register)
     }
 
+    /// Non-panicking address-range lookups. Use these in any path that can be
+    /// reached from gRPC handlers — an unknown slave/register from the upper
+    /// layer should yield a clean None, not a panic that takes the process
+    /// (and the ros2_control_node host) down.
+    fn try_get_reg_addr_range(
+        &self,
+        slave_id: u16,
+        register: &String,
+        index: usize,
+    ) -> Option<Range<usize>> {
+        try_get_reg_addr_range(&self.offsets, slave_id, register, index)
+    }
+
+    fn try_get_reg_addr_ranges(
+        &self,
+        slave_id: u16,
+        register: &String,
+    ) -> Option<Vec<Range<usize>>> {
+        try_get_reg_addr_ranges(&self.offsets, slave_id, register)
+    }
+
     /// Get the name of the slave with id
     pub fn get_slave_name(&self, slave_id: u16) -> Option<String> {
         self.slave_names
@@ -735,6 +781,42 @@ fn get_reg_addr_ranges(
         ranges.push(get_reg_addr_range(offsets, slave_id, register, i));
     }
     ranges
+}
+
+/// Non-panicking variant of `get_reg_addr_range`. Returns `None` if the
+/// `slave_id`, register name, or index is not present in `offsets`. The
+/// panicking variant is kept for init-time callers (where missing keys are
+/// a real config bug); runtime hot paths should use this one so that an
+/// out-of-spec query from a higher layer does not take down the cyclic
+/// loop / gRPC server / ros2_control_node host.
+fn try_get_reg_addr_range(
+    offsets: &SlaveOffsets,
+    slave_id: u16,
+    register: &String,
+    index: usize,
+) -> Option<Range<usize>> {
+    let slave_pos = SlavePos::from(slave_id);
+    let entries = offsets.get(&slave_pos)?.get(register)?;
+    let (_pdo_entry_idx, bit_len, offset) = entries.get(index)?;
+    let addr = offset.byte;
+    let bytes_len = (*bit_len / 8) as usize;
+    Some(addr..addr + bytes_len)
+}
+
+/// Non-panicking variant of `get_reg_addr_ranges`. See `try_get_reg_addr_range`.
+fn try_get_reg_addr_ranges(
+    offsets: &SlaveOffsets,
+    slave_id: u16,
+    register: &String,
+) -> Option<Vec<Range<usize>>> {
+    let slave_pos = SlavePos::from(slave_id);
+    let entries = offsets.get(&slave_pos)?.get(register)?;
+
+    let mut ranges = Vec::with_capacity(entries.len());
+    for i in 0..entries.len() {
+        ranges.push(try_get_reg_addr_range(offsets, slave_id, register, i)?);
+    }
+    Some(ranges)
 }
 
 /// Initialises the master for File Over EtherCAT (FOE) communication
