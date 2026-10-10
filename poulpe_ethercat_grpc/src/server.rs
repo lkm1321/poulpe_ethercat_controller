@@ -213,9 +213,9 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
             // instead so the next publish is the next on-time tick.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            // state to be sent if no state is available
-            // this is to avoid sending empty states
-            let mut last_state = poule_empty_state();
+            // Keep each slave's last valid sample, including its original timestamp.
+            // A failed read must not make stale feedback appear newly measured.
+            let mut last_states = HashMap::new();
 
             // DEBUGGING
             let mut nb_states = 0;
@@ -232,18 +232,15 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
                     states: request
                         .ids
                         .iter()
-                        .map(|&id| match get_state_for_id(&controller, id) {
-                            Ok(state) => {
-                                last_state = state.clone();
-                                state
-                            }
-                            Err(e) => {
-                                log::error!("Failed to get state for slave {}: {}. Returning stale state", id, e);
-                                let mut stale = last_state.clone();
-                                stale.published_timestamp = 
-                                    Some(Timestamp::from(std::time::SystemTime::now()));
-                                stale
-                            }
+                        .filter_map(|&id| {
+                            let fresh = match get_state_for_id(&controller, id) {
+                                Ok(state) => Some(state),
+                                Err(e) => {
+                                    log::error!("Failed to get state for slave {}: {}. Keeping last valid sample timestamp", id, e);
+                                    None
+                                }
+                            };
+                            cache_feedback(&mut last_states, id, fresh)
                         })
                         .collect(),
                 };
@@ -677,27 +674,71 @@ fn spawn_slave_recovery_thread(controller: Arc<PoulpeController>) {
         .expect("failed to spawn poulpe-recovery thread");
 }
 
-fn poule_empty_state() -> PoulpeState {
-    PoulpeState {
-        id: 0,
-        mode_of_operation: 0,
-        actual_position: vec![],
-        actual_velocity: vec![],
-        actual_torque: vec![],
-        axis_sensors: vec![],
-        axis_sensor_zeros: vec![],
-        motor_temperatures: vec![],
-        board_temperatures: vec![],
-        requested_target_position: vec![],
-        requested_velocity_limit: vec![],
-        requested_torque_limit: vec![],
-        state: 0,
-        error_codes: vec![],
-        compliant: false,
-        // Seed with "now" so the very first publish (which sends the empty
-        // state when slaves haven't enumerated yet) carries a fresh
-        // timestamp. A None here makes the client log "No timestamp" and
-        // can make downstream HIs treat the slot as ancient.
-        published_timestamp: Some(Timestamp::from(SystemTime::now())),
+fn cache_feedback(
+    last_states: &mut HashMap<i32, PoulpeState>,
+    id: i32,
+    fresh: Option<PoulpeState>,
+) -> Option<PoulpeState> {
+    if let Some(state) = fresh {
+        last_states.insert(id, state);
+    }
+    // Without a valid sample for this slave, omit it from the stream rather
+    // than inventing an empty state or reusing another slave's feedback.
+    last_states.get(&id).cloned()
+}
+
+#[cfg(test)]
+mod feedback_cache_tests {
+    use super::*;
+
+    fn sample(id: i32, seconds: i64, position: f32) -> PoulpeState {
+        PoulpeState {
+            id,
+            actual_position: vec![position],
+            published_timestamp: Some(Timestamp { seconds, nanos: 123 }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn repeated_failures_preserve_sample_timestamp_and_values() {
+        let mut cache = HashMap::new();
+        let original = sample(5, 100, 0.25);
+        cache_feedback(&mut cache, 5, Some(original.clone()));
+        for _ in 0..1000 {
+            assert_eq!(cache_feedback(&mut cache, 5, None), Some(original.clone()));
+        }
+    }
+
+    #[test]
+    fn failed_slave_never_receives_another_slaves_sample() {
+        let mut cache = HashMap::new();
+        let shoulder = sample(4, 100, 0.25);
+        let elbow = sample(5, 101, 0.75);
+        cache_feedback(&mut cache, 4, Some(shoulder.clone()));
+        cache_feedback(&mut cache, 5, Some(elbow.clone()));
+        assert_eq!(cache_feedback(&mut cache, 4, None), Some(shoulder));
+        assert_eq!(cache_feedback(&mut cache, 5, None), Some(elbow));
+    }
+
+    #[test]
+    fn failure_before_first_valid_sample_is_omitted() {
+        let mut cache = HashMap::new();
+        cache_feedback(&mut cache, 4, Some(sample(4, 100, 0.25)));
+        assert_eq!(cache_feedback(&mut cache, 5, None), None);
+        assert!(!cache.contains_key(&5));
+    }
+
+    #[test]
+    fn recovered_sample_replaces_only_its_own_cached_sample() {
+        let mut cache = HashMap::new();
+        let shoulder = sample(4, 100, 0.25);
+        let recovered = sample(5, 200, 0.95);
+        cache_feedback(&mut cache, 4, Some(shoulder.clone()));
+        cache_feedback(&mut cache, 5, Some(sample(5, 100, 0.75)));
+        cache_feedback(&mut cache, 5, None);
+        assert_eq!(cache_feedback(&mut cache, 5, Some(recovered.clone())), Some(recovered.clone()));
+        assert_eq!(cache_feedback(&mut cache, 5, None), Some(recovered));
+        assert_eq!(cache_feedback(&mut cache, 4, None), Some(shoulder));
     }
 }
