@@ -21,10 +21,12 @@ use crate::pb::{
     PoulpeCommands, PoulpeIds, PoulpeState, PoulpeStates, StateStreamRequest,
 };
 
+use crate::{feedback::collect_feedback, log_throttle::LogThrottle};
 use prost_types::Timestamp;
 #[derive(Debug)]
 struct PoulpeMultiplexerService {
     controller: Arc<PoulpeController>,
+    failure_logs: Arc<LogThrottle>,
 }
 
 fn get_state_for_id(
@@ -35,7 +37,6 @@ fn get_state_for_id(
 
     // check if slave ready, if not dont read its state
     if controller.is_slave_ready(slave_id as u16) == false {
-        log::error!("Slave (id: {}) not ready!", slave_id);
         return Err(("Slave not ready!").into());
     }
 
@@ -44,107 +45,84 @@ fn get_state_for_id(
         mode_of_operation: match controller.get_mode_of_operation_display(slave_id as u16) {
             Ok(mode) => mode as i32,
             _ => {
-                log::error!("Failed to get mode of operation for slave {}", slave_id);
                 return Err("Failed to get mode of operation".into());
             }
         },
         actual_position: match controller.get_current_position(slave_id) {
             Ok(Some(pos)) => pos,
             _ => {
-                log::error!("Failed to get actual position for slave {}", slave_id);
                 return Err("Failed to get actual position".into());
             }
         },
         actual_velocity: match controller.get_current_velocity(slave_id) {
             Ok(Some(vel)) => vel,
             _ => {
-                log::error!("Failed to get actual velocity for slave {}", slave_id);
                 return Err("Failed to get actual velocity".into());
             }
         },
         actual_torque: match controller.get_current_torque(slave_id) {
             Ok(Some(torque)) => torque,
             _ => {
-                log::error!("Failed to get actual torque for slave {}", slave_id);
                 return Err("Failed to get actual torque".into());
             }
         },
         axis_sensors: match controller.get_current_axis_sensors(slave_id) {
             Ok(Some(sensor)) => sensor,
             _ => {
-                log::error!("Failed to get axis sensor for slave {}", slave_id);
                 return Err("Failed to get axis sensor".into());
             }
         },
         axis_sensor_zeros: match controller.get_axis_sensor_zeros(slave_id) {
             Ok(Some(sensor)) => sensor,
             _ => {
-                log::error!("Failed to get axis sensor zeros for slave {}", slave_id);
                 return Err("Failed to get axis sensor zeros".into());
             }
         },
         board_temperatures: match controller.get_board_temperatures(slave_id) {
             Ok(Some(temps)) => temps,
             _ => {
-                log::error!("Failed to get board temperatures for slave {}", slave_id);
                 return Err("Failed to get board temperatures".into());
             }
         },
         motor_temperatures: match controller.get_motor_temperatures(slave_id) {
             Ok(Some(temps)) => temps,
             _ => {
-                log::error!("Failed to get motor temperatures for slave {}", slave_id);
                 return Err("Failed to get motor temperatures".into());
             }
         },
         requested_target_position: match controller.get_current_target_position(slave_id) {
             Ok(Some(pos)) => pos,
             _ => {
-                log::error!(
-                    "Failed to get requested target position for slave {}",
-                    slave_id
-                );
                 return Err("Failed to get requested target position".into());
             }
         },
         requested_velocity_limit: match controller.get_current_velocity_limit(slave_id) {
             Ok(Some(velocity_limit)) => velocity_limit,
             _ => {
-                log::error!(
-                    "Failed to get requested velcity limit for slave {}",
-                    slave_id
-                );
                 return Err("Failed to get requested  velcity limit".into());
             }
         },
         requested_torque_limit: match controller.get_current_torque_limit(slave_id) {
             Ok(Some(troque_limit)) => troque_limit,
             _ => {
-                log::error!(
-                    "Failed to get requested torque limit for slave {}",
-                    slave_id
-                );
                 return Err("Failed to get requested torque limit".into());
             }
         },
         state: match controller.get_status(slave_id) {
             Ok(state) => state as u32,
             _ => {
-                log::error!("Failed to get state for slave {}", slave_id);
                 return Err("Failed to get state".into());
             }
         },
         error_codes: match controller.get_error_codes(slave_id) {
             Ok(error_codes) => error_codes.iter().map(|x| *x as i32).collect(),
             _ => {
-                log::error!("Failed to get error codes for slave {}", slave_id);
                 return Err("Failed to get error codes".into());
             }
         },
         compliant: match controller.is_torque_on(slave_id) {
             Ok(Some(state)) => state,
             _ => {
-                log::error!("Failed to get torque state for slave {}", slave_id);
                 return Err("Failed to get torque state".into());
             }
         },
@@ -174,9 +152,10 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
         &self,
         request: Request<StateStreamRequest>,
     ) -> Result<Response<Self::GetStatesStream>, Status> {
-        let (tx, rx) = mpsc::channel(2);
+        let (tx, rx) = mpsc::channel(1);
 
         let controller = Arc::clone(&self.controller);
+        let failure_logs = Arc::clone(&self.failure_logs);
 
         let ids = request.get_ref().ids.clone();
         for id in ids.clone() {
@@ -213,10 +192,6 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
             // instead so the next publish is the next on-time tick.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            // Keep each slave's last valid sample, including its original timestamp.
-            // A failed read must not make stale feedback appear newly measured.
-            let mut last_states = HashMap::new();
-
             // DEBUGGING
             let mut nb_states = 0;
             let mut t_debug = tokio::time::Instant::now();
@@ -228,25 +203,26 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
                 // Wait until the next tick
                 interval.tick().await;
 
-                let states = PoulpeStates {
-                    states: request
-                        .ids
-                        .iter()
-                        .filter_map(|&id| {
-                            let fresh = match get_state_for_id(&controller, id) {
-                                Ok(state) => Some(state),
-                                Err(e) => {
-                                    log::error!("Failed to get state for slave {}: {}. Keeping last valid sample timestamp", id, e);
-                                    None
-                                }
-                            };
-                            cache_feedback(&mut last_states, id, fresh)
-                        })
-                        .collect(),
+                // Wait for capacity before sampling. Otherwise a sample can age
+                // while send().await waits behind a slow consumer. Keep at most
+                // one queued update; the next sample is read after it is taken.
+                let permit = match tx.reserve().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
                 };
-                if tx.send(Ok(states)).await.is_err() {
-                    break;
+                let states = PoulpeStates {
+                    states: collect_feedback(
+                        &request.ids,
+                        |id| get_state_for_id(&controller, id),
+                        &failure_logs,
+                    ),
+                };
+                // Keep the stream open during a dropout, but do not replay
+                // cached measurements or send empty updates at the cycle rate.
+                if states.states.is_empty() {
+                    continue;
                 }
+                permit.send(Ok(states));
 
                 // DEBUGGING
                 // send the report to the user about the states
@@ -297,7 +273,9 @@ impl PoulpeMultiplexer for PoulpeMultiplexerService {
             let mut slave_id: u32 = req.commands[0].id as u32;
             // check if the slave is ready and drop the command if not
             if self.controller.is_slave_ready(slave_id as u16) == false {
-                log::error!("Slave (id: {}) not ready!", slave_id);
+                if self.failure_logs.should_log(slave_id, "command") {
+                    log::error!("Slave (id: {}) not ready; dropping commands (repeated failures logged at most every 5s)", slave_id);
+                }
                 nb_dropped += 1;
                 continue;
             }
@@ -584,6 +562,7 @@ pub async fn launch_server(config_file: &str) -> Result<(), Box<dyn std::error::
 
     let srv = PoulpeMultiplexerService {
         controller: controller_arc,
+        failure_logs: Arc::new(LogThrottle::default()),
     };
 
     Server::builder()
@@ -672,73 +651,4 @@ fn spawn_slave_recovery_thread(controller: Arc<PoulpeController>) {
             }
         })
         .expect("failed to spawn poulpe-recovery thread");
-}
-
-fn cache_feedback(
-    last_states: &mut HashMap<i32, PoulpeState>,
-    id: i32,
-    fresh: Option<PoulpeState>,
-) -> Option<PoulpeState> {
-    if let Some(state) = fresh {
-        last_states.insert(id, state);
-    }
-    // Without a valid sample for this slave, omit it from the stream rather
-    // than inventing an empty state or reusing another slave's feedback.
-    last_states.get(&id).cloned()
-}
-
-#[cfg(test)]
-mod feedback_cache_tests {
-    use super::*;
-
-    fn sample(id: i32, seconds: i64, position: f32) -> PoulpeState {
-        PoulpeState {
-            id,
-            actual_position: vec![position],
-            published_timestamp: Some(Timestamp { seconds, nanos: 123 }),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn repeated_failures_preserve_sample_timestamp_and_values() {
-        let mut cache = HashMap::new();
-        let original = sample(5, 100, 0.25);
-        cache_feedback(&mut cache, 5, Some(original.clone()));
-        for _ in 0..1000 {
-            assert_eq!(cache_feedback(&mut cache, 5, None), Some(original.clone()));
-        }
-    }
-
-    #[test]
-    fn failed_slave_never_receives_another_slaves_sample() {
-        let mut cache = HashMap::new();
-        let shoulder = sample(4, 100, 0.25);
-        let elbow = sample(5, 101, 0.75);
-        cache_feedback(&mut cache, 4, Some(shoulder.clone()));
-        cache_feedback(&mut cache, 5, Some(elbow.clone()));
-        assert_eq!(cache_feedback(&mut cache, 4, None), Some(shoulder));
-        assert_eq!(cache_feedback(&mut cache, 5, None), Some(elbow));
-    }
-
-    #[test]
-    fn failure_before_first_valid_sample_is_omitted() {
-        let mut cache = HashMap::new();
-        cache_feedback(&mut cache, 4, Some(sample(4, 100, 0.25)));
-        assert_eq!(cache_feedback(&mut cache, 5, None), None);
-        assert!(!cache.contains_key(&5));
-    }
-
-    #[test]
-    fn recovered_sample_replaces_only_its_own_cached_sample() {
-        let mut cache = HashMap::new();
-        let shoulder = sample(4, 100, 0.25);
-        let recovered = sample(5, 200, 0.95);
-        cache_feedback(&mut cache, 4, Some(shoulder.clone()));
-        cache_feedback(&mut cache, 5, Some(sample(5, 100, 0.75)));
-        cache_feedback(&mut cache, 5, None);
-        assert_eq!(cache_feedback(&mut cache, 5, Some(recovered.clone())), Some(recovered.clone()));
-        assert_eq!(cache_feedback(&mut cache, 5, None), Some(recovered));
-        assert_eq!(cache_feedback(&mut cache, 4, None), Some(shoulder));
-    }
 }

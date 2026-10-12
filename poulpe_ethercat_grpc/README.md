@@ -8,14 +8,16 @@ The server creates the ethercat master and creates the gprc api that allows the 
 Client server communication in gprc is not real-time and given that we are controlling a real-time system, all the messages exchanged between the server and the client are timestamped and security checks are performed to ensure that the messages are not too old.
 
 - If server reads the clients message that has a timestamp older than 5ms, it will ignore it
-- If client reads the server messages that are older than 1second (defined in the configuration file), it will consider that the server is down and will kill the program
-    - If the feature `stop_client_on_server_timeout` is set the clients will stop their operation if the server is down
+- If a client's last feedback sample for a slave is older than one second, its getters return an error. The Rust client does not exit the host process; callers must handle unavailable feedback.
+- During degraded operation, the server omits failed slave reads instead of replaying cached measurements. If all reads fail, the stream stays open without sending empty updates. Successful reads resume publication automatically.
+- The server waits for outgoing queue capacity before reading feedback and queues at most one update. This reduces queue-induced age; it does not make disconnected devices' feedback fresh.
+- Repeated feedback-read and command-readiness errors are logged at most once per slave and operation every five seconds, shared across server streams. Client missing/stale-feedback warnings have the same limit per client instance. Client libraries must be rebuilt to pick up that throttling; updating only the server does not change clients already deployed.
 
 ### Safety features
 
 This crate implements the following safety features:
 - Make sure tha the real-time communication is established between the server and the client
-    - If the server is not responding, the client will stop the operation (if the feature `stop_client_on_server_timeout` is enabled)
+    - If feedback is unavailable or stale, client getters return an error
     - All client messages that are older than 5ms are ignored by the server
 - Make sure that all the slaves are in the operational state
     - If the slave is not operational, the server will not respond to the client messages
@@ -26,7 +28,7 @@ This crate implements the following safety features:
 
 feature | description | enabled by default
 --- | --- | ---
-`stop_client_on_server_timeout` | Stop the client if the server is not responding | yes
+`stop_client_on_server_timeout` | Legacy feature; no longer exits the client on stale feedback | yes
 `qucik_stop_on_slave_fault` | Send the emergency stop to all the actuators if one of them is in the error state | yes
 `stop_server_on_actuator_error` | Stop the server if one of the actuators is in the error state | no
 

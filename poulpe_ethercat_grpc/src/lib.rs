@@ -3,6 +3,8 @@ pub mod pb {
 }
 
 pub mod client;
+mod feedback;
+mod log_throttle;
 pub use client::PoulpeRemoteClient;
 
 pub mod server;

@@ -1230,11 +1230,12 @@ fn get_slave_current_state(
                 AlState::Op as u8
             }
         }
-        Err(_) => {
+        Err(e) => {
             log::error!(
-                "Failed to get slave info for slave {:?}, name: {:?}",
+                "Failed to get slave info for slave {:?}, name: {:?}: {:?}",
                 slave_pos,
-                slave_name_from_id(slave_pos.into())
+                slave_name_from_id(slave_pos.into()),
+                e
             );
             255
         }
@@ -1251,7 +1252,13 @@ fn log_master_state(
     #[cfg(feature = "verify_mailbox_pdos")] slave_is_mailbox_pdo_responding: &Vec<bool>,
     #[cfg(feature = "enable_watchdog")] slave_is_watchdog_responding: &Vec<bool>,
 ) {
-    let m_state = master.state().unwrap();
+    let m_state = match master.state() {
+        Ok(state) => state,
+        Err(e) => {
+            log::error!("Failed to get master state for diagnostics: {:?}", e);
+            return;
+        }
+    };
     log::debug!(
         "Master State: {:?}, Link up: {}, Slaves connected: {} out of {}",
         m_state.al_states,
@@ -1301,8 +1308,13 @@ fn log_master_state(
                     );
                 }
             }
-            Err(_) => {
-                log::error!("Slave {:?} not connected!", i);
+            Err(e) => {
+                log::error!(
+                    "Failed to get slave info for slave {} ({}): {:?}",
+                    i,
+                    slave_name_from_id(i as u16),
+                    e
+                );
             }
         }
     }

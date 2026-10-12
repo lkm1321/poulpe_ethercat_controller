@@ -4,6 +4,7 @@ use super::pb::{
     poulpe_multiplexer_client::PoulpeMultiplexerClient, PoulpeCommand, PoulpeCommands, PoulpeState,
     StateStreamRequest,
 };
+use crate::log_throttle::LogThrottle;
 use prost_types::Timestamp;
 use tokio::{
     runtime::{Builder, Handle, Runtime},
@@ -42,6 +43,7 @@ pub struct PoulpeRemoteClient {
     addr: Uri,
     state: Arc<RwLock<HashMap<u16, PoulpeState>>>,
     command_buff: Arc<RwLock<HashMap<u16, Vec<Command>>>>,
+    feedback_logs: LogThrottle,
 }
 
 impl PoulpeRemoteClient {
@@ -280,6 +282,7 @@ impl PoulpeRemoteClient {
             addr,
             state,
             command_buff,
+            feedback_logs: LogThrottle::default(),
         })
     }
 
@@ -312,7 +315,12 @@ impl PoulpeRemoteClient {
     {
         let state = self.rt.block_on(self.state.read());
         let state = state.get(&slave_id).ok_or_else(|| {
-            log::warn!("No state found for slave {}", slave_id);
+            if self.feedback_logs.should_log(slave_id as u32, "missing") {
+                log::warn!(
+                    "No state found for slave {} (repeated warnings logged at most every 5s)",
+                    slave_id
+                );
+            }
         })?;
 
         if let Some(ts) = &state.published_timestamp {
@@ -322,16 +330,18 @@ impl PoulpeRemoteClient {
                 // arrived), not a fatal panic.
                 let age = systime.elapsed().unwrap_or_default();
                 if age.as_millis() > 1000 {
-                    // The server has stopped publishing for >1s. Surface this to the
+                    // No fresh feedback for this slave for >1s. Surface this to the
                     // caller as an error so it can react (hold position, etc.), but do
                     // NOT terminate the host process — the reconnect loop in this
                     // client and the recovery FSM in the server are expected to bring
                     // the stream back without a manual restart.
-                    log::warn!(
-                        "State for slave {} is {} ms old; server may be temporarily down",
-                        slave_id,
-                        age.as_millis()
-                    );
+                    if self.feedback_logs.should_log(slave_id as u32, "stale") {
+                        log::warn!(
+                            "State for slave {} is {} ms old; slave or server may be unavailable (repeated warnings logged at most every 5s)",
+                            slave_id,
+                            age.as_millis()
+                        );
+                    }
                     return Err(());
                 }
             } else {
